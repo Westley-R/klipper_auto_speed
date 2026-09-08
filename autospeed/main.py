@@ -12,6 +12,8 @@ from .funcs import calculate_graph, calculate_accel, calculate_velocity
 from .move import Move, MoveX, MoveY, MoveZ, MoveDiagX, MoveDiagY
 from .wrappers import ResultsWrapper, AttemptWrapper
 
+import logging
+
 class AutoSpeed:
     def __init__(self, config):
         self.config = config
@@ -61,7 +63,9 @@ class AutoSpeed:
         self.results_dir = os.path.expanduser(config.get('results_dir',default=results_default))
 
         self.toolhead = None
+        self.probe = None
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("homing:homing_move_end", self.handle_homing_move_end)
         self.printer.register_event_handler("homing:home_rails_end", self.handle_home_rails_end)
 
         self.gcode.register_command('AUTO_SPEED',
@@ -96,6 +100,7 @@ class AutoSpeed:
 
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
+        self.probe = self.printer.lookup_object('bltouch', None) or self.printer.lookup_object('probe', None)
         # Reduce speed/acceleration for positioning movement
         self.th_accel = self.toolhead.max_accel/2
         self.th_veloc = self.toolhead.max_velocity/2
@@ -110,6 +115,39 @@ class AutoSpeed:
             self.level = "QGL"
         else:
             self.level = None
+
+    def handle_homing_move_end(self, homing_move_state):
+        endstops = homing_move_state.get_mcu_endstops()
+        if len(endstops) == 1:
+            if type(endstops[0]).__name__ in ["BLTouchProbe"]:
+                kinematics = self.toolhead.get_kinematics()
+                kinematics_status = kinematics.get_status(None)
+                homed_axes = kinematics_status.get('homed_axes', [])
+
+                config = self.printer.lookup_object('configfile')
+
+                if 'z' in homed_axes and 'stepper_z' in config.status_raw_config:
+                    z_conf = config.status_raw_config['stepper_z']
+
+                    pos_min = z_conf.get('position_min', None)
+                    pos_max = z_conf.get('position_max', None)
+                    microsteps = z_conf.get('microsteps', None)
+
+                    homing_retract_dist = float(z_conf.get("homing_retract_dist", 5.0))
+                    second_homing_speed = float(z_conf.get("second_homing_speed", 5.0))
+
+                    data = [pos_min, pos_max, microsteps, homing_retract_dist, second_homing_speed]
+                    if None not in data:
+                        self.steppers['z'] = [float(pos_min), float(pos_max), int(microsteps), homing_retract_dist, second_homing_speed]
+
+                if self.steppers.get("z", None) is not None:
+                    self.axis_limits["z"] = {
+                        "min": self.steppers["z"][0],
+                        "max": self.steppers["z"][1],
+                        "center": (self.steppers["z"][0] + self.steppers["z"][1]) / 2,
+                        "dist": self.steppers["z"][1] - self.steppers["z"][0],
+                        "home": self.gcode_move.homing_position[2]
+                    }
 
     def handle_home_rails_end(self, homing_state, rails):
         # Get axis min/max values
@@ -133,6 +171,7 @@ class AutoSpeed:
                             second_homing_speed = 5 # This shouldn't be hardcoded
                         second_homing_speed = float(second_homing_speed)
                         self.steppers[name[-1]] = [pos_min, pos_max, microsteps, homing_retract_dist, second_homing_speed]
+                        logging.info(f"{name[-1]}")
 
             if self.steppers.get("x", None) is not None:
                 self.axis_limits["x"] = {
@@ -691,6 +730,7 @@ class AutoSpeed:
             }
         }
         for _ in range(0, samples):
+            self.gcode._process_commands(["G1 X10 Y10"], False)
             self.toolhead.wait_moves()
             self._home(x, y, False)
             steps = self._get_steps()
